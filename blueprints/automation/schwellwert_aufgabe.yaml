@@ -1,0 +1,143 @@
+blueprint:
+  name: Schwellwert erreicht → Aufgabe erstellen
+  description: >
+    Überwacht eine beliebige Entität. Sobald ihr Zustand einen frei definierbaren
+    Wert unterschreitet (numerisch), überschreitet (numerisch) oder einen
+    bestimmten Text annimmt, wird in einer frei wählbaren Aufgabenliste eine
+    Aufgabe angelegt. Das Fälligkeitsdatum ist der Tag, an dem die Bedingung
+    eingetreten ist.
+
+
+    Im Aufgabentitel und in der Beschreibung können Templates verwendet werden.
+    Verfügbare Variablen: `entity_name`, `new_state`, `old_state`, `target`.
+  domain: automation
+  homeassistant:
+    min_version: "2024.10.0"
+  input:
+    watched_entity:
+      name: Zu prüfende Entität
+      description: Die Entität, deren Zustand überwacht wird.
+      selector:
+        entity: {}
+    compare_mode:
+      name: Vergleichsart
+      description: Wie soll der Zustand mit dem Vergleichswert verglichen werden?
+      default: below
+      selector:
+        select:
+          mode: dropdown
+          options:
+            - label: Fällt unter Wert (numerisch)
+              value: below
+            - label: Steigt über Wert (numerisch)
+              value: above
+            - label: Entspricht Text
+              value: equals
+            - label: Entspricht nicht mehr Text
+              value: not_equals
+    target_value:
+      name: Vergleichswert
+      description: >
+        Zahl (z. B. 20 oder 12.5) für numerische Vergleiche, oder Text
+        (z. B. "off", "leer", "low") für Textvergleiche. Groß-/Kleinschreibung
+        wird bei Text ignoriert.
+      selector:
+        text: {}
+    todo_list:
+      name: Aufgabenliste
+      description: Die Aufgabenliste, in die die Aufgabe eingetragen wird.
+      selector:
+        entity:
+          filter:
+            - domain: todo
+    task_summary:
+      name: Aufgabentitel
+      default: "{{ entity_name }} prüfen"
+      selector:
+        text: {}
+    task_description:
+      name: Beschreibung (optional)
+      default: "{{ entity_name }} hat den Zustand {{ new_state }} (Vergleichswert: {{ target }})."
+      selector:
+        text:
+          multiline: true
+    prevent_duplicates:
+      name: Doppelte Aufgaben verhindern
+      description: >
+        Keine neue Aufgabe anlegen, wenn in der Liste bereits eine offene Aufgabe
+        mit gleichem Titel existiert.
+      default: true
+      selector:
+        boolean: {}
+
+mode: queued
+max_exceeded: silent
+
+triggers:
+  - trigger: state
+    entity_id: !input watched_entity
+
+variables:
+  compare_mode: !input compare_mode
+  target: !input target_value
+  todo_list: !input todo_list
+  prevent_duplicates: !input prevent_duplicates
+  entity_name: "{{ trigger.to_state.name }}"
+  new_state: "{{ trigger.to_state.state }}"
+  old_state: "{{ trigger.from_state.state if trigger.from_state else 'unknown' }}"
+
+conditions:
+  # Nur echte Zustandswechsel, keine reinen Attributänderungen
+  - condition: template
+    value_template: "{{ trigger.from_state is not none and trigger.to_state is not none and new_state != old_state }}"
+  # Ungültige Zustände ignorieren (z. B. nach Neustart)
+  - condition: template
+    value_template: "{{ new_state not in ['unknown', 'unavailable'] and old_state not in ['unknown', 'unavailable'] }}"
+  # Eigentlicher Vergleich: nur beim Überschreiten der Grenze auslösen
+  - condition: template
+    value_template: >
+      {% set t = target | string | trim %}
+      {% if compare_mode in ['below', 'above'] %}
+        {% if is_number(new_state) and is_number(t) %}
+          {% set n = new_state | float %}
+          {% set o = old_state | float(none) %}
+          {% set v = t | float %}
+          {% if compare_mode == 'below' %}
+            {{ n < v and (o is none or o >= v) }}
+          {% else %}
+            {{ n > v and (o is none or o <= v) }}
+          {% endif %}
+        {% else %}
+          false
+        {% endif %}
+      {% elif compare_mode == 'equals' %}
+        {{ new_state | lower == t | lower and old_state | lower != t | lower }}
+      {% else %}
+        {{ old_state | lower == t | lower and new_state | lower != t | lower }}
+      {% endif %}
+
+actions:
+  - variables:
+      summary: !input task_summary
+      description: !input task_description
+      due: "{{ now().strftime('%Y-%m-%d') }}"
+  - action: todo.get_items
+    target:
+      entity_id: "{{ todo_list }}"
+    data:
+      status: needs_action
+    response_variable: todo_items
+  - if:
+      - condition: template
+        value_template: >
+          {% set items = todo_items[todo_list]['items'] if todo_list in todo_items else [] %}
+          {{ not prevent_duplicates
+             or items | selectattr('summary', 'eq', summary) | list | count == 0 }}
+    then:
+      - action: todo.add_item
+        target:
+          entity_id: "{{ todo_list }}"
+        data:
+          item: "{{ summary }}"
+          due_date: "{{ due }}"
+          description: "{{ description }}"
