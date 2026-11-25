@@ -1,0 +1,173 @@
+blueprint:
+  name: Datums-Attribute → Aufgaben erstellen
+  description: >
+    Prüft eine Entität, deren Attribute Datumswerte enthalten (z. B.
+    `rueckspuelung: 2026-12-07`). Ist ein Datum erreicht – oder liegt es innerhalb
+    der eingestellten Vorlaufzeit – wird in einer frei wählbaren Aufgabenliste
+    eine Aufgabe mit diesem Datum als Fälligkeitsdatum angelegt.
+
+
+    Attribute ohne Datum (z. B. `icon`, `friendly_name`) werden automatisch
+    ignoriert. Optional können die zu prüfenden Attribute fest vorgegeben werden.
+
+
+    Im Aufgabentitel und in der Beschreibung können Templates verwendet werden.
+    Verfügbare Variablen: `entity_name`, `attribute`, `attribute_label`,
+    `due_date` (JJJJ-MM-TT), `days_left`.
+  domain: automation
+  homeassistant:
+    min_version: "2024.10.0"
+  input:
+    watched_entity:
+      name: Zu prüfende Entität
+      description: Entität, deren Attribute Datumswerte enthalten.
+      selector:
+        entity: {}
+    attributes:
+      name: Attribute (optional)
+      description: >
+        Namen der zu prüfenden Attribute, z. B. `rueckspuelung`. Leer lassen,
+        um alle Attribute mit Datumswert zu prüfen.
+      default: []
+      selector:
+        text:
+          multiple: true
+    days_before:
+      name: Vorlauf (Tage)
+      description: >
+        Wie viele Tage vor dem Datum die Aufgabe angelegt werden soll.
+        0 = am Tag selbst.
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 60
+          unit_of_measurement: Tage
+          mode: box
+    overdue_days:
+      name: Überfällige Termine (Tage)
+      description: >
+        Termine, die bis zu so vielen Tagen in der Vergangenheit liegen, werden
+        noch berücksichtigt (z. B. wenn Home Assistant am Stichtag aus war).
+      default: 7
+      selector:
+        number:
+          min: 0
+          max: 365
+          unit_of_measurement: Tage
+          mode: box
+    check_time:
+      name: Prüfzeit
+      description: Uhrzeit der täglichen Prüfung.
+      default: "08:00:00"
+      selector:
+        time: {}
+    todo_list:
+      name: Aufgabenliste
+      selector:
+        entity:
+          filter:
+            - domain: todo
+    task_summary:
+      name: Aufgabentitel
+      default: "{{ entity_name }}: {{ attribute_label }}"
+      selector:
+        text: {}
+    task_description:
+      name: Beschreibung (optional)
+      default: "{{ attribute_label }} fällig am {{ strptime(due_date, '%Y-%m-%d').strftime('%d.%m.%Y') }}."
+      selector:
+        text:
+          multiline: true
+    prevent_duplicates:
+      name: Doppelte Aufgaben verhindern
+      description: >
+        Keine neue Aufgabe anlegen, wenn in der Liste bereits eine Aufgabe
+        (offen oder erledigt) mit gleichem Titel und gleichem Fälligkeitsdatum existiert.
+      default: true
+      selector:
+        boolean: {}
+
+mode: single
+max_exceeded: silent
+
+triggers:
+  - trigger: time
+    at: !input check_time
+  - trigger: homeassistant
+    event: start
+  - trigger: state
+    entity_id: !input watched_entity
+
+variables:
+  entity: !input watched_entity
+  selected_attrs: !input attributes
+  days_before: !input days_before
+  overdue_days: !input overdue_days
+  todo_list: !input todo_list
+  prevent_duplicates: !input prevent_duplicates
+  entity_name: "{{ state_attr(entity, 'friendly_name') or entity }}"
+  due_items: >
+    {% set ns = namespace(items=[]) %}
+    {% set st = states[entity] %}
+    {% if st is not none %}
+      {% set attrs = st.attributes %}
+      {% set keys = selected_attrs if selected_attrs | count > 0 else attrs.keys() | list %}
+      {% set today = now().date() %}
+      {% for k in keys %}
+        {% set k = k | trim %}
+        {% set v = attrs.get(k) | string %}
+        {% if v is match('\d{4}-\d{2}-\d{2}') %}
+          {% set d = strptime(v[:10], '%Y-%m-%d', none) %}
+          {% if d is not none %}
+            {% set diff = (d.date() - today).days %}
+            {% if diff <= days_before | int and diff >= -(overdue_days | int) %}
+              {% set ns.items = ns.items + [{'attribute': k, 'date': d.strftime('%Y-%m-%d'), 'days': diff}] %}
+            {% endif %}
+          {% endif %}
+        {% endif %}
+      {% endfor %}
+    {% endif %}
+    {{ ns.items }}
+
+conditions:
+  - condition: template
+    value_template: "{{ due_items | count > 0 }}"
+
+actions:
+  - repeat:
+      for_each: "{{ due_items }}"
+      sequence:
+        - variables:
+            attribute: "{{ repeat.item.attribute }}"
+            attribute_label: "{{ repeat.item.attribute | replace('_', ' ') | capitalize }}"
+            due_date: "{{ repeat.item.date }}"
+            days_left: "{{ repeat.item.days }}"
+        - variables:
+            summary: !input task_summary
+            description: !input task_description
+        - action: todo.get_items
+          target:
+            entity_id: "{{ todo_list }}"
+          data:
+            status:
+              - needs_action
+              - completed
+          response_variable: todo_items
+        - if:
+            - condition: template
+              value_template: >
+                {% set items = todo_items[todo_list]['items'] if todo_list in todo_items else [] %}
+                {{ not prevent_duplicates
+                   or items | selectattr('summary', 'eq', summary)
+                            | selectattr('due', 'defined')
+                            | selectattr('due', 'eq', due_date)
+                            | list | count == 0 }}
+          then:
+            - action: todo.add_item
+              target:
+                entity_id: "{{ todo_list }}"
+              data:
+                item: "{{ summary }}"
+                due_date: "{{ due_date }}"
+                description: "{{ description }}"
